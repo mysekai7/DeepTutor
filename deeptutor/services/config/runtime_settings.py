@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 from deeptutor.services.file_io import atomic_write_json as _atomic_write_json
@@ -50,6 +51,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 CHAT_ATTACHMENT_MAX_FILE_MB_RANGE = (1, 1024)
 CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE = (1, 2048)
 CHAT_ATTACHMENT_CHARS_RANGE = (10_000, 5_000_000)
+_PERSONA_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "version": 1,
@@ -987,6 +989,11 @@ class RuntimeSettingsService:
         )
         # A per-message total below the per-file cap is contradictory; lift it.
         max_total_mb = max(max_total_mb, max_file_mb)
+        default_persona = _string(settings.get("default_persona"))
+        if default_persona and not _PERSONA_NAME_RE.fullmatch(default_persona):
+            raise ValueError(
+                "default_persona must match ^[a-z0-9][a-z0-9-]{0,63}$"
+            )
         return {
             "version": 1,
             "backend_port": _coerce_port(settings.get("backend_port"), 8001),
@@ -997,7 +1004,7 @@ class RuntimeSettingsService:
             "cors_origins": _coerce_origins(settings.get("cors_origins")),
             "disable_ssl_verify": _coerce_bool(settings.get("disable_ssl_verify"), False),
             "chat_attachment_dir": _string(settings.get("chat_attachment_dir")),
-            "default_persona": _string(settings.get("default_persona")),
+            "default_persona": default_persona,
             "sandbox_allow_subprocess": _coerce_bool(
                 settings.get("sandbox_allow_subprocess"), True
             ),

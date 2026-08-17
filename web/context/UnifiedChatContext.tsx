@@ -22,7 +22,9 @@ import type { StreamEvent, ChatMessage, LLMSelection } from "@/lib/unified-ws";
 import { UnifiedWSClient } from "@/lib/unified-ws";
 import {
   personaFieldsForTurn,
-  personaSelectionFromSessionEvent,
+  personaReplaySelection,
+  personaSnapshotFields,
+  sessionPersonaUpdateFromEvent,
 } from "@/lib/persona-session";
 import {
   getSession,
@@ -1029,10 +1031,7 @@ function hydrateRequestSnapshot(
   const questionNotebookReferences = asQuestionReferences(
     stored.questionNotebookReferences,
   );
-  const persona =
-    typeof stored.persona === "string" && stored.persona.length > 0
-      ? stored.persona
-      : "";
+
   const memoryReferences = asMemoryReferences(stored.memoryReferences);
   const bookReferences = normalizeBookReferences(stored.bookReferences);
   const llmSelection = asLLMSelection(stored.llmSelection);
@@ -1049,7 +1048,10 @@ function hydrateRequestSnapshot(
     snapshot.questionNotebookReferences = questionNotebookReferences;
   }
   if (bookReferences.length) snapshot.bookReferences = bookReferences;
-  if (persona) snapshot.persona = persona;
+  if (stored.personaExplicit === true) {
+    snapshot.personaExplicit = true;
+    snapshot.persona = typeof stored.persona === "string" ? stored.persona : "";
+  }
   if (memoryReferences.length) snapshot.memoryReferences = memoryReferences;
   if (llmSelection) snapshot.llmSelection = llmSelection;
   if (masteryPathId) snapshot.masteryPathId = masteryPathId;
@@ -1151,7 +1153,7 @@ export function UnifiedChatProvider({
       const runner = runnersRef.current.get(runnerKey);
       const effectiveKey = runner?.key || runnerKey;
       if (event.type === "session") {
-        const resolvedPersona = personaSelectionFromSessionEvent(event);
+        const personaUpdate = sessionPersonaUpdateFromEvent(effectiveKey, event);
         const sessionId =
           (event.metadata as { session_id?: string } | undefined)?.session_id ||
           event.session_id ||
@@ -1169,11 +1171,10 @@ export function UnifiedChatProvider({
           });
           moveRunner(effectiveKey, sessionId);
         }
-        if (resolvedPersona !== undefined) {
+        if (personaUpdate) {
           dispatch({
             type: "SET_SESSION_PERSONA",
-            key: sessionId || effectiveKey,
-            persona: resolvedPersona,
+            ...personaUpdate,
           });
         }
         return;
@@ -1617,12 +1618,12 @@ export function UnifiedChatProvider({
         replaySnapshot?.language ?? readStoredResponseLanguage();
       // Persona resolution: replay snapshot wins; then an explicit per-call
       // persona (quiz follow-up surface); then the session-level preference.
-      const effectivePersona =
-        replaySnapshot?.persona ?? persona ?? session.personaSelection ?? "";
-      const personaExplicit =
-        (replaySnapshot !== undefined && "persona" in replaySnapshot) ||
-        persona !== undefined ||
-        session.personaExplicit;
+      const personaState = personaReplaySelection(replaySnapshot, persona, {
+        selection: session.personaSelection ?? "",
+        explicit: session.personaExplicit,
+      });
+      const effectivePersona = personaState.selection;
+      const personaExplicit = personaState.explicit;
       const effectiveMemoryReferences =
         replaySnapshot?.memoryReferences ?? memoryReferences;
       const effectiveBookReferences =
@@ -1674,7 +1675,11 @@ export function UnifiedChatProvider({
         ...(effectiveMasteryPathId
           ? { masteryPathId: effectiveMasteryPathId }
           : {}),
-        ...(effectivePersona ? { persona: effectivePersona } : {}),
+        ...personaSnapshotFields({
+          persona: effectivePersona,
+          personaExplicit,
+        }),
+        ...(personaExplicit ? { personaExplicit: true } : {}),
         ...(effectiveMemoryReferences?.length
           ? { memoryReferences: [...effectiveMemoryReferences] }
           : {}),

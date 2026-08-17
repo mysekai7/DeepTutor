@@ -237,6 +237,34 @@ class TestRegenerateLastTurn:
 
         assert recorder.calls[0]["mastery_path_id"] == "path-1"
 
+    @pytest.mark.parametrize(
+        ("snapshot", "expected_present", "expected_value"),
+        [
+            ({}, False, None),
+            ({"persona": "", "personaExplicit": True}, True, ""),
+            ({"persona": "teacher", "personaExplicit": True}, True, "teacher"),
+        ],
+    )
+    def test_replays_persona_request_presence_from_snapshot(
+        self,
+        store: SQLiteSessionStore,
+        snapshot: dict[str, Any],
+        expected_present: bool,
+        expected_value: str | None,
+    ) -> None:
+        sid, _, _ = _seed_session(store, user_metadata={"request_snapshot": snapshot})
+        asyncio.run(store.update_session_preferences(sid, {"persona": "stored-teacher"}))
+        runtime = TurnRuntimeManager(store=store)
+        recorder = _FakeStartTurnRecorder()
+
+        with patch.object(runtime, "start_turn", new=recorder):
+            asyncio.run(runtime.regenerate_last_turn(sid))
+
+        payload = recorder.calls[0]
+        assert ("persona" in payload) is expected_present
+        if expected_present:
+            assert payload["persona"] == expected_value
+
     def test_user_tail_is_kept_and_no_delete(self, store: SQLiteSessionStore) -> None:
         sid, user_id, _ = _seed_session(store, assistant_content=None)
         runtime = TurnRuntimeManager(store=store)

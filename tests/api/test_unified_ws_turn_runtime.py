@@ -6,7 +6,10 @@ import pytest
 
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.services.session.sqlite_store import SQLiteSessionStore
-from deeptutor.services.session.turn_runtime import TurnRuntimeManager
+from deeptutor.services.session.turn_runtime import (
+    TurnRuntimeManager,
+    _request_snapshot_metadata,
+)
 
 
 async def _noop_async(*_args, **_kwargs):
@@ -406,6 +409,14 @@ async def test_turn_runtime_new_session_default_persona_respects_explicit_and_ex
     monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
     monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
 
+    def fake_admin_persona_context(name: str) -> str:
+        return _fake_persona_service().load_for_context(name)
+
+    monkeypatch.setattr(
+        "deeptutor.services.session.turn_runtime._load_admin_persona_context",
+        fake_admin_persona_context,
+    )
+
     async def run_turn(session_id, extra):
         session, turn = await runtime.start_turn(
             {
@@ -465,7 +476,9 @@ async def test_turn_runtime_new_session_default_persona_respects_explicit_and_ex
     assert events[0]["metadata"]["persona"] == ""
     detail = await store.get_session_with_messages(cleared["id"])
     assert detail["preferences"]["persona"] == ""
-    assert "persona" not in detail["messages"][0]["metadata"]["request_snapshot"]
+    snapshot = detail["messages"][0]["metadata"]["request_snapshot"]
+    assert snapshot["persona"] == ""
+    assert snapshot["personaExplicit"] is True
 
     # An existing session without any persona preference stays empty; the
     # configured default is strictly a new-session behavior.
@@ -512,6 +525,158 @@ async def test_turn_runtime_invalid_default_persona_is_not_applied_or_persisted(
     assert "persona" not in detail["preferences"]
     assert first_event["type"] == "session"
     assert first_event["metadata"]["persona"] == ""
+
+
+@pytest.mark.asyncio
+async def test_deployment_default_persona_uses_admin_workspace_without_user_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "admin-default.db")
+    runtime = TurnRuntimeManager(store)
+
+    async def noop_run_turn(_execution) -> None:
+        return None
+
+    monkeypatch.setattr(runtime, "_run_turn", noop_run_turn)
+    monkeypatch.setattr(
+        "deeptutor.services.config.runtime_settings.load_system_settings",
+        lambda: {"default_persona": "teacher"},
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.session.turn_runtime._load_admin_persona_context",
+        lambda name: f"admin:{name}",
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.session.turn_runtime._load_persona_context",
+        lambda name: f"user-shadow:{name}",
+    )
+
+    session, turn = await runtime.start_turn(
+        {
+            "content": "hi",
+            "session_id": None,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+    execution = runtime._executions[turn["id"]]
+    if execution.task is not None:
+        await execution.task
+
+    assert execution.payload["persona"] == "teacher"
+    assert execution.payload["_persona_context"] == "admin:teacher"
+    detail = await store.get_session_with_messages(session["id"])
+    assert detail["preferences"]["persona"] == "teacher"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["explicit", "stored"])
+async def test_missing_persona_updates_event_preference_and_runtime_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    source: str,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / f"missing-{source}.db")
+    runtime = TurnRuntimeManager(store)
+
+    async def noop_run_turn(_execution) -> None:
+        return None
+
+    monkeypatch.setattr(runtime, "_run_turn", noop_run_turn)
+    monkeypatch.setattr(
+        "deeptutor.services.session.turn_runtime._load_persona_context", lambda _name: ""
+    )
+    session_id = None
+    extra = {"persona": "missing"}
+    if source == "stored":
+        stored_session = await store.create_session()
+        session_id = stored_session["id"]
+        await store.update_session_preferences(session_id, {"persona": "missing"})
+        extra = {}
+
+    session, turn = await runtime.start_turn(
+        {
+            "content": "hi",
+            "session_id": session_id,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+            **extra,
+        }
+    )
+    event = await anext(runtime.subscribe_turn(turn["id"], after_seq=0))
+    execution = runtime._executions[turn["id"]]
+    if execution.task is not None:
+        await execution.task
+    detail = await store.get_session_with_messages(session["id"])
+
+    assert event["metadata"]["persona"] == ""
+    assert detail["preferences"]["persona"] == ""
+    assert execution.payload["persona"] == ""
+    assert execution.payload["_persona_context"] == ""
+
+
+@pytest.mark.asyncio
+async def test_start_turn_resolves_persona_once_into_runtime_only_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "persona-once.db")
+    runtime = TurnRuntimeManager(store)
+    calls: list[str] = []
+
+    async def noop_run_turn(_execution) -> None:
+        return None
+
+    def resolve(name: str) -> str:
+        calls.append(name)
+        return "resolved-context"
+
+    monkeypatch.setattr(runtime, "_run_turn", noop_run_turn)
+    monkeypatch.setattr("deeptutor.services.session.turn_runtime._load_persona_context", resolve)
+
+    _, turn = await runtime.start_turn(
+        {
+            "content": "hi",
+            "session_id": None,
+            "persona": "teacher",
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+    execution = runtime._executions[turn["id"]]
+    if execution.task is not None:
+        await execution.task
+
+    assert calls == ["teacher"]
+    assert execution.payload["_persona_context"] == "resolved-context"
+    snapshot = _request_snapshot_metadata(
+        payload=execution.payload,
+        content="hi",
+        capability="chat",
+        config={},
+        attachments=[],
+        notebook_references=[],
+        history_references=[],
+        question_notebook_references=[],
+        book_references=[],
+        persona="teacher",
+        persona_explicit=True,
+        memory_references=[],
+        llm_selection=None,
+    )["request_snapshot"]
+    assert snapshot["persona"] == "teacher"
+    assert snapshot["personaExplicit"] is True
+    assert "_persona_context" not in snapshot
 
 
 @pytest.mark.asyncio
