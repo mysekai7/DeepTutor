@@ -57,6 +57,19 @@ def test_runtime_settings_creates_defaults_without_reading_dotenv(tmp_path: Path
     assert _read_json(service.path_for("auth"))["enabled"] is False
 
 
+def test_system_settings_roundtrip_default_persona(tmp_path: Path) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
+
+    assert service.load_system(include_process_overrides=False)["default_persona"] == ""
+
+    service.save_system({"default_persona": "  primary-grade4-tutor  "})
+
+    assert service.load_system(include_process_overrides=False)["default_persona"] == (
+        "primary-grade4-tutor"
+    )
+    assert _read_json(service.path_for("system"))["default_persona"] == "primary-grade4-tutor"
+
+
 def test_runtime_process_env_is_explicit_override(tmp_path: Path) -> None:
     service = RuntimeSettingsService(
         tmp_path / "settings",

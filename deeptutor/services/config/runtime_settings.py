@@ -22,6 +22,9 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "cors_origins": [],
     "disable_ssl_verify": False,
     "chat_attachment_dir": "",
+    # Optional Persona applied only when a caller creates a new chat session
+    # without sending a ``persona`` key. Empty preserves the product default.
+    "default_persona": "",
     # Enable the restricted-subprocess code-execution sandbox (the `exec` /
     # `code_execution` tools the office skills — docx/pdf/pptx/xlsx — run on).
     # Default on so document generation works out of the box across all
@@ -994,6 +997,7 @@ class RuntimeSettingsService:
             "cors_origins": _coerce_origins(settings.get("cors_origins")),
             "disable_ssl_verify": _coerce_bool(settings.get("disable_ssl_verify"), False),
             "chat_attachment_dir": _string(settings.get("chat_attachment_dir")),
+            "default_persona": _string(settings.get("default_persona")),
             "sandbox_allow_subprocess": _coerce_bool(
                 settings.get("sandbox_allow_subprocess"), True
             ),

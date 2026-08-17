@@ -358,14 +358,17 @@ async def test_turn_runtime_persists_llm_selection_in_turn_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_turn_runtime_session_persona_persists_falls_back_and_clears(
+async def test_turn_runtime_new_session_default_persona_respects_explicit_and_existing_choices(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    """Persona is a session preference: explicit key persists (incl. ""),
-    absent key falls back to the stored preference."""
+    """Only a new session with no persona key receives the configured default."""
     store = SQLiteSessionStore(tmp_path / "chat_history.db")
     runtime = TurnRuntimeManager(store)
+    monkeypatch.setattr(
+        "deeptutor.services.config.runtime_settings.load_system_settings",
+        lambda: {"default_persona": "configured-tutor"},
+    )
 
     class FakeContextBuilder:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -418,29 +421,97 @@ async def test_turn_runtime_session_persona_persists_falls_back_and_clears(
                 **extra,
             }
         )
-        async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
-            pass
-        return session
+        events = [event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)]
+        return session, events
 
-    # Turn 1 — explicit persona: applied to the turn AND persisted.
-    session = await run_turn(None, {"persona": "socratic"})
-    detail = await store.get_session_with_messages(session["id"])
-    assert detail["preferences"]["persona"] == "socratic"
-    assert detail["messages"][0]["metadata"]["request_snapshot"]["persona"] == "socratic"
+    # New session + absent persona key: configured default is applied and
+    # persisted as this session's preference.
+    defaulted, events = await run_turn(None, {})
+    assert events[0]["type"] == "session"
+    assert events[0]["metadata"]["persona"] == "configured-tutor"
+    detail = await store.get_session_with_messages(defaulted["id"])
+    assert detail["preferences"]["persona"] == "configured-tutor"
+    assert (
+        detail["messages"][0]["metadata"]["request_snapshot"]["persona"]
+        == "configured-tutor"
+    )
 
-    # Turn 2 — persona key ABSENT: falls back to the stored preference, so
-    # the persona keeps applying to follow-up questions in the session.
-    await run_turn(session["id"], {})
-    detail = await store.get_session_with_messages(session["id"])
+    # A caller-supplied but stale/missing session id also creates a genuinely
+    # new session and must receive the configured default.
+    recreated, events = await run_turn("missing-session-id", {})
+    assert recreated["id"] != "missing-session-id"
+    assert events[0]["metadata"]["persona"] == "configured-tutor"
+    detail = await store.get_session_with_messages(recreated["id"])
+    assert detail["preferences"]["persona"] == "configured-tutor"
+
+    # Existing session + absent key: stored preference wins, even if the
+    # deployment default later changes.
+    await store.update_session_preferences(defaulted["id"], {"persona": "socratic"})
+    _, events = await run_turn(defaulted["id"], {})
+    assert events[0]["metadata"]["persona"] == "socratic"
+    detail = await store.get_session_with_messages(defaulted["id"])
     assert detail["preferences"]["persona"] == "socratic"
     assert detail["messages"][2]["metadata"]["request_snapshot"]["persona"] == "socratic"
 
-    # Turn 3 — explicit "" (Default): clears the stored preference and the
-    # turn runs without a persona.
-    await run_turn(session["id"], {"persona": ""})
-    detail = await store.get_session_with_messages(session["id"])
+    # Explicit non-empty persona on a new session is never overwritten.
+    explicit, events = await run_turn(None, {"persona": "teacher"})
+    assert events[0]["metadata"]["persona"] == "teacher"
+    detail = await store.get_session_with_messages(explicit["id"])
+    assert detail["preferences"]["persona"] == "teacher"
+    assert detail["messages"][0]["metadata"]["request_snapshot"]["persona"] == "teacher"
+
+    # Explicit empty persona means no Persona and must remain an explicit clear.
+    cleared, events = await run_turn(None, {"persona": ""})
+    assert events[0]["metadata"]["persona"] == ""
+    detail = await store.get_session_with_messages(cleared["id"])
     assert detail["preferences"]["persona"] == ""
-    assert "persona" not in detail["messages"][4]["metadata"]["request_snapshot"]
+    assert "persona" not in detail["messages"][0]["metadata"]["request_snapshot"]
+
+    # An existing session without any persona preference stays empty; the
+    # configured default is strictly a new-session behavior.
+    existing_empty = await store.create_session()
+    _, events = await run_turn(existing_empty["id"], {})
+    assert events[0]["metadata"]["persona"] == ""
+    detail = await store.get_session_with_messages(existing_empty["id"])
+    assert "persona" not in detail["preferences"]
+    assert "persona" not in detail["messages"][0]["metadata"]["request_snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_turn_runtime_invalid_default_persona_is_not_applied_or_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "chat_history.db")
+    runtime = TurnRuntimeManager(store)
+    monkeypatch.setattr(
+        "deeptutor.services.config.runtime_settings.load_system_settings",
+        lambda: {"default_persona": "missing-persona"},
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.session.turn_runtime._load_persona_context",
+        lambda _name: "",
+    )
+
+    session, turn = await runtime.start_turn(
+        {
+            "type": "start_turn",
+            "content": "hi",
+            "session_id": None,
+            "capability": None,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+    first_event = await anext(runtime.subscribe_turn(turn["id"], after_seq=0))
+
+    detail = await store.get_session_with_messages(session["id"])
+    assert "persona" not in detail["preferences"]
+    assert first_event["type"] == "session"
+    assert first_event["metadata"]["persona"] == ""
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,10 @@ import {
 import type { StreamEvent, ChatMessage, LLMSelection } from "@/lib/unified-ws";
 import { UnifiedWSClient } from "@/lib/unified-ws";
 import {
+  personaFieldsForTurn,
+  personaSelectionFromSessionEvent,
+} from "@/lib/persona-session";
+import {
   getSession,
   deleteMessage,
   updateBranchSelection,
@@ -92,9 +96,10 @@ export interface ChatState {
   llmSelection: LLMSelection | null;
   /** Persistent mastery state associated with this conversation. */
   masteryPathId: string | null;
-  /** Session-level persona preference; "" = Default (no persona). Applies
-   *  to every following message until changed (persisted on the session). */
+  /** Session-level persona preference; "" = no persona. */
   personaSelection: string;
+  /** False only for a fresh untouched draft, allowing the backend default. */
+  personaExplicit: boolean;
   messages: MessageItem[];
   isStreaming: boolean;
   currentStage: string;
@@ -144,6 +149,7 @@ export interface MessageRequestSnapshot {
   bookReferences?: BookReferencePayload[];
   masteryPathId?: string;
   persona?: string;
+  personaExplicit?: boolean;
   memoryReferences?: MemoryReferencePayload;
   llmSelection?: LLMSelection | null;
 }
@@ -193,6 +199,7 @@ interface SessionSnapshot {
   llmSelection?: LLMSelection | null;
   masteryPathId?: string | null;
   personaSelection?: string;
+  personaExplicit?: boolean;
   language?: string;
   selectedBranches?: Record<string, number>;
 }
@@ -206,7 +213,8 @@ type Action =
   // session that produced it, which may no longer be the selected one. The
   // composer omits it and means "the one on screen".
   | { type: "SET_MASTERY_PATH_ID"; masteryPathId: string | null; key?: string }
-  | { type: "SET_PERSONA_SELECTION"; persona: string }
+  | { type: "SET_PERSONA_SELECTION"; persona: string; explicit?: boolean }
+  | { type: "SET_SESSION_PERSONA"; key: string; persona: string }
   | { type: "SET_LANGUAGE"; lang: string }
   | {
       type: "ADD_USER_MSG";
@@ -274,6 +282,7 @@ function createSessionEntry(
     llmSelection: null,
     masteryPathId: null,
     personaSelection: "",
+    personaExplicit: false,
     messages: [],
     isStreaming: false,
     currentStage: "",
@@ -381,7 +390,23 @@ function reducer(state: ProviderState, action: Action): ProviderState {
       return updateSelectedSession(state, (session) => ({
         ...session,
         personaSelection: action.persona,
+        personaExplicit: action.explicit ?? true,
       }));
+    case "SET_SESSION_PERSONA": {
+      const session = state.sessions[action.key];
+      if (!session) return state;
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [action.key]: {
+            ...session,
+            personaSelection: action.persona,
+            personaExplicit: true,
+          },
+        },
+      };
+    }
     case "SET_LANGUAGE":
       return updateSelectedSession(state, (session) => ({
         ...session,
@@ -661,6 +686,10 @@ function reducer(state: ProviderState, action: Action): ProviderState {
               action.personaSelection !== undefined
                 ? action.personaSelection
                 : existing.personaSelection,
+            personaExplicit:
+              action.personaExplicit !== undefined
+                ? action.personaExplicit
+                : existing.personaExplicit,
             messages: action.messages,
             isStreaming: (action.status || "idle") === "running",
             currentStage: "",
@@ -1122,6 +1151,7 @@ export function UnifiedChatProvider({
       const runner = runnersRef.current.get(runnerKey);
       const effectiveKey = runner?.key || runnerKey;
       if (event.type === "session") {
+        const resolvedPersona = personaSelectionFromSessionEvent(event);
         const sessionId =
           (event.metadata as { session_id?: string } | undefined)?.session_id ||
           event.session_id ||
@@ -1138,6 +1168,13 @@ export function UnifiedChatProvider({
             turnId,
           });
           moveRunner(effectiveKey, sessionId);
+        }
+        if (resolvedPersona !== undefined) {
+          dispatch({
+            type: "SET_SESSION_PERSONA",
+            key: sessionId || effectiveKey,
+            persona: resolvedPersona,
+          });
         }
         return;
       }
@@ -1420,6 +1457,7 @@ export function UnifiedChatProvider({
           typeof session.preferences?.persona === "string"
             ? session.preferences.persona
             : "",
+        personaExplicit: true,
         // Model output language is account-level state. Historical sessions
         // may have stale persisted preferences, so new turns follow the
         // current response-language setting rather than their original value.
@@ -1579,9 +1617,12 @@ export function UnifiedChatProvider({
         replaySnapshot?.language ?? readStoredResponseLanguage();
       // Persona resolution: replay snapshot wins; then an explicit per-call
       // persona (quiz follow-up surface); then the session-level preference.
-      // Always a string — "" means Default / no persona.
       const effectivePersona =
         replaySnapshot?.persona ?? persona ?? session.personaSelection ?? "";
+      const personaExplicit =
+        (replaySnapshot !== undefined && "persona" in replaySnapshot) ||
+        persona !== undefined ||
+        session.personaExplicit;
       const effectiveMemoryReferences =
         replaySnapshot?.memoryReferences ?? memoryReferences;
       const effectiveBookReferences =
@@ -1704,11 +1745,10 @@ export function UnifiedChatProvider({
         ...(effectiveMasteryPathId
           ? { mastery_path_id: effectiveMasteryPathId }
           : {}),
-        // Always sent (possibly ""): an explicit key is the backend's signal
-        // to persist the value into session.preferences — "" clears back to
-        // Default. Omitting the key would make the backend fall back to the
-        // stored preference, so a clear could never propagate.
-        persona: effectivePersona,
+        ...personaFieldsForTurn({
+          selection: effectivePersona,
+          explicit: personaExplicit,
+        }),
         ...(effectiveMemoryReferences?.length
           ? { memory_references: effectiveMemoryReferences }
           : {}),
@@ -1832,6 +1872,7 @@ export function UnifiedChatProvider({
       llmSelection: current.llmSelection,
       masteryPathId: current.masteryPathId,
       personaSelection: current.personaSelection,
+      personaExplicit: current.personaExplicit,
       messages: current.messages,
       isStreaming: current.isStreaming,
       currentStage: current.currentStage,
