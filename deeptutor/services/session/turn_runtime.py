@@ -31,6 +31,38 @@ logger = logging.getLogger(__name__)
 MemoryReference = Literal["recent", "profile", "scope", "preferences", "summary"]
 
 
+def _load_persona_context(name: str) -> str:
+    """Resolve a Persona exactly as a turn will consume it."""
+    requested = str(name or "").strip()
+    if not requested:
+        return ""
+
+    from deeptutor.multi_user.context import get_current_user
+    from deeptutor.multi_user.paths import get_admin_path_service
+    from deeptutor.services.persona import PersonaService, get_persona_service
+
+    context = get_persona_service().load_for_context(requested)
+    if not context and not get_current_user().is_admin:
+        context = PersonaService(
+            root=get_admin_path_service().get_workspace_dir() / "personas"
+        ).load_for_context(requested)
+    return context
+
+
+def _load_admin_persona_context(name: str) -> str:
+    """Resolve a deployment-owned Persona without user-workspace shadowing."""
+    requested = str(name or "").strip()
+    if not requested:
+        return ""
+
+    from deeptutor.multi_user.paths import get_admin_path_service
+    from deeptutor.services.persona import PersonaService
+
+    return PersonaService(
+        root=get_admin_path_service().get_workspace_dir() / "personas"
+    ).load_for_context(requested)
+
+
 # Content call_kinds that make up the persisted answer. The chat agent loop
 # streams every round's text as ``content`` with ``agent_loop_round``; the
 # finish round (and forced-finish) are the answer, narration rounds are
@@ -220,6 +252,7 @@ def _request_snapshot_metadata(
     question_notebook_references: list[Any],
     book_references: list[Any],
     persona: str,
+    persona_explicit: bool,
     memory_references: Sequence[str],
     llm_selection: dict[str, str] | None,
 ) -> dict[str, Any]:
@@ -246,8 +279,9 @@ def _request_snapshot_metadata(
     mastery_path_id = _mastery_path_id(payload.get("mastery_path_id"))
     if mastery_path_id:
         snapshot["masteryPathId"] = mastery_path_id
-    if persona:
+    if persona_explicit:
         snapshot["persona"] = persona
+        snapshot["personaExplicit"] = True
     if memory_references:
         snapshot["memoryReferences"] = memory_references
     if llm_selection:
@@ -792,7 +826,14 @@ class TurnRuntimeManager:
             "capability": capability,
             "config": {**validated_public_config, **runtime_only_config},
         }
-        session = await self.store.ensure_session(payload.get("session_id"))
+        requested_session_id = payload.get("session_id")
+        requested_session = (
+            await self.store.get_session(str(requested_session_id))
+            if requested_session_id
+            else None
+        )
+        session_is_new = requested_session is None
+        session = requested_session or await self.store.ensure_session(requested_session_id)
         preferences = session.get("preferences") or {}
         # A mastery path has a longer lifetime than any one conversation.
         # Persist the explicit association on the session, and restore it on
@@ -822,10 +863,46 @@ class TurnRuntimeManager:
         # absent key falls back to the session's stored preference so the
         # active persona survives reloads and follows the session.
         persona_explicit = "persona" in payload
-        persona_pref = str(
-            (payload.get("persona") if persona_explicit else preferences.get("persona")) or ""
+        persona_defaulted = False
+        if session_is_new and not persona_explicit:
+            from deeptutor.services.config.runtime_settings import load_system_settings
+
+            configured_default = str(load_system_settings().get("default_persona") or "").strip()
+            if configured_default:
+                payload = {**payload, "persona": configured_default}
+                persona_defaulted = True
+        requested_persona = str(
+            (
+                payload.get("persona")
+                if persona_explicit or persona_defaulted
+                else preferences.get("persona")
+            )
+            or ""
         ).strip()
-        payload = {**payload, "persona": persona_pref}
+        persona_context = (
+            _load_admin_persona_context(requested_persona)
+            if persona_defaulted
+            else _load_persona_context(requested_persona)
+        )
+        persona_pref = requested_persona if persona_context else ""
+        persona_invalid = bool(requested_persona and not persona_context)
+        if persona_defaulted and persona_invalid:
+            logger.warning(
+                "Configured default Persona %r is unavailable in the admin workspace; "
+                "continuing without a Persona",
+                requested_persona,
+            )
+            persona_defaulted = False
+        payload = {
+            **payload,
+            "persona": persona_pref,
+            "_persona_context": persona_context,
+            # Once a session preference resolves to a real Persona, snapshot it
+            # explicitly so regenerate/replay reproduces this turn even if the
+            # session preference changes later. An empty inherited preference
+            # remains omitted, preserving the new-session default distinction.
+            "_persona_explicit": persona_explicit or persona_defaulted or bool(persona_pref),
+        }
         raw_llm_selection = payload.get("llm_selection")
         if raw_llm_selection is None:
             raw_llm_selection = preferences.get("llm_selection")
@@ -924,8 +1001,10 @@ class TurnRuntimeManager:
         }
         if llm_selection:
             preference_update["llm_selection"] = llm_selection
-        if persona_explicit:
-            # Persist explicit set AND explicit clear ("" = back to Default).
+        if persona_explicit or persona_defaulted or (persona_invalid and not session_is_new):
+            # Persist the actual effective value. Invalid explicit/stored names
+            # become an empty preference so selectors and future turns agree;
+            # an invalid deployment default leaves a fresh session untouched.
             preference_update["persona"] = persona_pref
         if mastery_path_explicit or mastery_binding is not None:
             # Mastery turns persist their fully resolved path so a later turn
@@ -980,6 +1059,7 @@ class TurnRuntimeManager:
         session_metadata: dict[str, Any] = {
             "session_id": session["id"],
             "turn_id": turn["id"],
+            "persona": persona_pref,
         }
         regenerated_from = runtime_only_config.get("_regenerated_from_message_id")
         if regenerated_from is not None:
@@ -1129,6 +1209,8 @@ class TurnRuntimeManager:
             "mastery_path_id": mastery_path_id,
             "config": config,
         }
+        if snapshot.get("personaExplicit") is True:
+            payload["persona"] = str(snapshot.get("persona") or "")
         if llm_selection:
             payload["llm_selection"] = llm_selection
         return await self.start_turn(payload)
@@ -1559,19 +1641,11 @@ class TurnRuntimeManager:
             from deeptutor.multi_user.context import get_current_user
             from deeptutor.multi_user.paths import get_admin_path_service
             from deeptutor.multi_user.skill_access import assigned_skill_ids
-            from deeptutor.services.persona import PersonaService, get_persona_service
             from deeptutor.services.skill.service import SkillService, render_skills_manifest
 
             current_user = get_current_user()
-            requested_persona = str(payload.get("persona") or "").strip()
-            persona_context = ""
-            if requested_persona:
-                persona_context = get_persona_service().load_for_context(requested_persona)
-                if not persona_context and not current_user.is_admin:
-                    persona_context = PersonaService(
-                        root=get_admin_path_service().get_workspace_dir() / "personas"
-                    ).load_for_context(requested_persona)
-            active_persona = requested_persona if persona_context else ""
+            persona_context = str(payload.get("_persona_context") or "")
+            active_persona = str(payload.get("persona") or "").strip() if persona_context else ""
 
             # Skills: never user-selected per turn. The model sees a
             # one-line manifest of every skill visible to this user (own +
@@ -1795,6 +1869,7 @@ class TurnRuntimeManager:
                         question_notebook_references=question_notebook_references,
                         book_references=book_references,
                         persona=active_persona,
+                        persona_explicit=bool(payload.get("_persona_explicit")),
                         memory_references=memory_references,
                         llm_selection=payload.get("llm_selection"),
                     ),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from deeptutor.services.config.runtime_settings import (
     RuntimeSettingsService,
     ensure_runtime_settings_files,
@@ -55,6 +57,27 @@ def test_runtime_settings_creates_defaults_without_reading_dotenv(tmp_path: Path
 
     assert _read_json(service.path_for("system"))["backend_port"] == 8001
     assert _read_json(service.path_for("auth"))["enabled"] is False
+
+
+def test_system_settings_roundtrip_default_persona(tmp_path: Path) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
+
+    assert service.load_system(include_process_overrides=False)["default_persona"] == ""
+
+    service.save_system({"default_persona": "  primary-grade4-tutor  "})
+
+    assert service.load_system(include_process_overrides=False)["default_persona"] == (
+        "primary-grade4-tutor"
+    )
+    assert _read_json(service.path_for("system"))["default_persona"] == "primary-grade4-tutor"
+
+
+@pytest.mark.parametrize("invalid", ["Teacher Name", "../teacher", "-teacher", "teacher_1"])
+def test_system_settings_rejects_invalid_default_persona_slug(tmp_path: Path, invalid: str) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
+
+    with pytest.raises(ValueError, match="default_persona"):
+        service.save_system({"default_persona": invalid})
 
 
 def test_runtime_process_env_is_explicit_override(tmp_path: Path) -> None:
