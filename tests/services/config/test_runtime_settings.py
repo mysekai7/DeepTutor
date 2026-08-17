@@ -73,9 +73,7 @@ def test_system_settings_roundtrip_default_persona(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("invalid", ["Teacher Name", "../teacher", "-teacher", "teacher_1"])
-def test_system_settings_rejects_invalid_default_persona_slug(
-    tmp_path: Path, invalid: str
-) -> None:
+def test_system_settings_rejects_invalid_default_persona_slug(tmp_path: Path, invalid: str) -> None:
     service = RuntimeSettingsService(tmp_path / "settings", process_env={})
 
     with pytest.raises(ValueError, match="default_persona"):

@@ -828,7 +828,9 @@ class TurnRuntimeManager:
         }
         requested_session_id = payload.get("session_id")
         requested_session = (
-            await self.store.get_session(str(requested_session_id)) if requested_session_id else None
+            await self.store.get_session(str(requested_session_id))
+            if requested_session_id
+            else None
         )
         session_is_new = requested_session is None
         session = requested_session or await self.store.ensure_session(requested_session_id)
@@ -1643,9 +1645,7 @@ class TurnRuntimeManager:
 
             current_user = get_current_user()
             persona_context = str(payload.get("_persona_context") or "")
-            active_persona = (
-                str(payload.get("persona") or "").strip() if persona_context else ""
-            )
+            active_persona = str(payload.get("persona") or "").strip() if persona_context else ""
 
             # Skills: never user-selected per turn. The model sees a
             # one-line manifest of every skill visible to this user (own +

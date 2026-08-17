@@ -991,9 +991,7 @@ class RuntimeSettingsService:
         max_total_mb = max(max_total_mb, max_file_mb)
         default_persona = _string(settings.get("default_persona"))
         if default_persona and not _PERSONA_NAME_RE.fullmatch(default_persona):
-            raise ValueError(
-                "default_persona must match ^[a-z0-9][a-z0-9-]{0,63}$"
-            )
+            raise ValueError("default_persona must match ^[a-z0-9][a-z0-9-]{0,63}$")
         return {
             "version": 1,
             "backend_port": _coerce_port(settings.get("backend_port"), 8001),

@@ -442,10 +442,7 @@ async def test_turn_runtime_new_session_default_persona_respects_explicit_and_ex
     assert events[0]["metadata"]["persona"] == "configured-tutor"
     detail = await store.get_session_with_messages(defaulted["id"])
     assert detail["preferences"]["persona"] == "configured-tutor"
-    assert (
-        detail["messages"][0]["metadata"]["request_snapshot"]["persona"]
-        == "configured-tutor"
-    )
+    assert detail["messages"][0]["metadata"]["request_snapshot"]["persona"] == "configured-tutor"
 
     # A caller-supplied but stale/missing session id also creates a genuinely
     # new session and must receive the configured default.
